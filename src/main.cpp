@@ -3,6 +3,7 @@
 #include <ArduinoJson.h>
 #include <ArduinoOTA.h>
 #include <ESPmDNS.h>
+#include <NTPClient.h>
 #include <WebServer.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
@@ -10,6 +11,11 @@
 WebServer server(80);
 
 Adafruit_MLX90640 mlx;
+
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP);
+
+RTC_DATA_ATTR int lastRestartDay = -1;
 
 #define ROWS   24
 #define COLS   32
@@ -33,7 +39,8 @@ uint16_t getPixel(int x, int y) {
 }
 
 char data[PIXELS * 5];
-StaticJsonDocument<4096> doc;
+JsonDocument doc;
+
 void getRaw(uint8_t send_pixels) {
     uint16_t data_offset = 0;
 
@@ -224,6 +231,12 @@ void setup() {
     Serial.print("Got IP: ");
     Serial.println(WiFi.localIP());
 
+    timeClient.begin();
+    timeClient.update();
+    Serial.println("NTP time synchronized!");
+    Serial.print("Current time: ");
+    Serial.println(timeClient.getFormattedTime());
+
     ArduinoOTA
         .onStart([]() {
             String type;
@@ -271,4 +284,20 @@ void loop() {
 
     server.handleClient();
     ArduinoOTA.handle();
+
+    timeClient.update();
+
+    if (timeClient.getHours() == 5) {
+        int currentDay = timeClient.getDay();
+
+        if (currentDay != lastRestartDay) {
+            Serial.println("Restarting ESP32...");
+            lastRestartDay = currentDay;
+            delay(1000);
+
+            // 1s deep sleep instead of restart to keep lastRestartDay in memory
+            esp_sleep_enable_timer_wakeup(1000000);
+            esp_deep_sleep_start();
+        }
+    }
 }
