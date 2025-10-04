@@ -2,13 +2,13 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <ArduinoOTA.h>
+#include <ESPAsyncWebServer.h>
 #include <ESPmDNS.h>
 #include <NTPClient.h>
-#include <WebServer.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
 
-WebServer server(80);
+AsyncWebServer server(80);
 
 Adafruit_MLX90640 mlx;
 
@@ -128,21 +128,8 @@ void getRaw(uint8_t send_pixels) {
     doc["avg"] = avg;
     doc["person_detected"] = person_detected;
 
-    String new_output;
-    serializeJson(doc, new_output);
-    output = new_output;
+    serializeJson(doc, output);
 }
-
-void sendRaw() {
-    getRaw(1);
-    server.send(200, "application/json", output.c_str());
-}
-void sendBinarySensor() {
-    getRaw(0);
-    server.send(200, "application/json", output.c_str());
-}
-
-void notFound() { server.send(404, "text/plain", "Not found"); }
 
 void setup() {
     // while (!Serial)
@@ -267,22 +254,32 @@ void setup() {
 
     ArduinoOTA.begin();
 
-    server.on("/binary_sensor/raw", sendBinarySensor);
-    server.on("/raw", sendRaw);
+    server.on("/binary_sensor/raw", [](AsyncWebServerRequest *request) {
+        getRaw(0);
+        request->send(200, "application/json", output);
+    });
+    server.on("/raw", [](AsyncWebServerRequest *request) {
+        getRaw(1);
+        request->send(200, "application/json", output);
+    });
 
-    server.onNotFound(notFound);
+    server.onNotFound([](AsyncWebServerRequest *request) { request->send(404); });
 
     server.begin();
 }
 
+uint32_t last_frame_update;
 void loop() {
-    if (mlx.getFrame(current_frame) == 0) {
-        for (int i = 0; i < PIXELS; i++) {
-            pixels[i] = ((uint16_t)(current_frame[i] * 10.0f)) / 2 + pixels[i] / 2;
+    if (millis() - last_frame_update >= 125) {
+        if (mlx.getFrame(current_frame) == 0) {
+            last_frame_update = millis();
+
+            for (int i = 0; i < PIXELS; i++) {
+                pixels[i] = ((uint16_t)(current_frame[i] * 10.0f)) / 2 + pixels[i] / 2;
+            }
         }
     }
 
-    server.handleClient();
     ArduinoOTA.handle();
 
     timeClient.update();
