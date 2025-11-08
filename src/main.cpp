@@ -1,6 +1,7 @@
 #include <Adafruit_MLX90640.h>
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <ArduinoNvs.h>
 #include <ArduinoOTA.h>
 #include <ESPAsyncWebServer.h>
 #include <ESPmDNS.h>
@@ -17,76 +18,90 @@ NTPClient timeClient(ntpUDP);
 
 RTC_DATA_ATTR int lastRestartDay = -1;
 
-#define ROWS   24
-#define COLS   32
-#define PIXELS (ROWS * COLS)
+#define LED_PIN 21
+#define ROWS    24
+#define COLS    32
+#define PIXELS  (ROWS * COLS)
 
-// all uint16_t are fixed decimal (eg 35 means 3.5°C)
-const uint16_t humanThreshold = 35;
+const float humanThreshold = 5;
+
+uint8_t ignore_mask[PIXELS];
 
 float current_frame[PIXELS];
-uint16_t pixels[PIXELS];
+float pixels[PIXELS];
 
 String output;
 
 const char *sensor = "MLX90640";
 
-uint16_t getPixel(int x, int y) {
+float getPixel(int x, int y) {
     if (x <= ROWS && x > 0 && y <= COLS && y > 0) {
         return pixels[x * COLS + y];
     }
     return 0;
 }
+float getIgnoreMask(int x, int y) {
+    if (x <= ROWS && x > 0 && y <= COLS && y > 0) {
+        return ignore_mask[x * COLS + y];
+    }
+    return 0;
+}
 
-char data[PIXELS * 5];
+char data[PIXELS * 10];
 JsonDocument doc;
 
-void getRaw(uint8_t send_pixels) {
+void getRaw() {
     uint16_t data_offset = 0;
 
-    uint16_t min = pixels[0];
-    uint16_t max = pixels[0];
-    uint32_t avg = 0;
+    float min = 99;
+    float max = 0;
+    float avg = 0;
+    uint16_t avg_pixels = 0;
 
     for (int i = 0; i < PIXELS; i++) {
-        uint16_t pixel_temperature = pixels[i];
+        if (ignore_mask[i] == 0) {
+            float pixel_temperature = pixels[i];
 
-        if (pixel_temperature > max) {
-            max = pixel_temperature;
-        }
-        if (pixel_temperature < min) {
-            min = pixel_temperature;
-        }
-
-        avg += pixel_temperature;
-
-        if (send_pixels == 1) {
-            uint16_t written = sprintf(data + data_offset, "%u", pixel_temperature);
-            data_offset += written;
-
-            if (i < PIXELS - 1) {
-                data[data_offset] = ',';
-                data_offset++;
+            if (pixel_temperature > max) {
+                max = pixel_temperature;
             }
+            if (pixel_temperature < min) {
+                min = pixel_temperature;
+            }
+
+            avg += pixel_temperature;
+            avg_pixels++;
+        }
+    }
+    avg = avg / avg_pixels;
+
+    for (int i = 0; i < PIXELS; i++) {
+        float pixel_temperature = ignore_mask[i] == 0 ? pixels[i] : 0;
+
+        uint16_t written = sprintf(data + data_offset, "%0.1f", pixel_temperature);
+        data_offset += written;
+
+        if (i < PIXELS - 1) {
+            data[data_offset] = ',';
+            data_offset++;
         }
     }
     data[data_offset] = 0;
 
-    avg = avg / PIXELS;
-    uint16_t personThreshold = humanThreshold + avg;
+    float personThreshold = humanThreshold + avg;
 
     bool person_detected = false;
     for (int i = 0; i < PIXELS; i++) {
         int r = i / COLS;
         int c = i % COLS;
 
-        if (c >= COLS - 7) {
+        if (getIgnoreMask(r, c) != 0) {
             continue;
         }
         if (getPixel(r, c) > personThreshold) {
             int blobSize = 1;
 
-            int neighbourThreshold = avg + 10;
+            int neighbourThreshold = avg + 1.0;
 
             if (getPixel(r + 1, c - 1) > neighbourThreshold) {
                 blobSize++;
@@ -122,34 +137,21 @@ void getRaw(uint8_t send_pixels) {
     doc["sensor"] = sensor;
     doc["rows"] = ROWS;
     doc["cols"] = COLS;
-    doc["data"] = send_pixels == 1 ? data : String("0").c_str();
-    doc["min"] = min;
-    doc["max"] = max;
-    doc["avg"] = avg;
+    doc["data"] = data;
+    doc["min"] = (int)(min * 10.0) / 10.0;
+    doc["max"] = (int)(max * 10.0) / 10.0;
+    doc["avg"] = (int)(avg * 10.0) / 10.0;
     doc["person_detected"] = person_detected;
 
     serializeJson(doc, output);
 }
 
-void setup() {
-    // while (!Serial)
-    //   delay(10);
-    Serial.begin(115200);
-
-    Wire.begin(1, 3, 800000);
-    Serial.println("Adafruit MLX90640");
-    if (!mlx.begin(MLX90640_I2CADDR_DEFAULT, &Wire)) {
-        Serial.println("MLX90640 not found!");
-        while (1) delay(10);
-    }
-    Serial.println("Found Adafruit MLX90640");
-
+void printSensorInfo() {
     Serial.print("Serial number: ");
     Serial.print(mlx.serialNumber[0], HEX);
     Serial.print(mlx.serialNumber[1], HEX);
     Serial.println(mlx.serialNumber[2], HEX);
 
-    mlx.setMode(MLX90640_CHESS);
     Serial.print("Current mode: ");
     if (mlx.getMode() == MLX90640_CHESS) {
         Serial.println("Chess");
@@ -157,7 +159,6 @@ void setup() {
         Serial.println("Interleave");
     }
 
-    mlx.setResolution(MLX90640_ADC_19BIT);
     Serial.print("Current resolution: ");
     mlx90640_resolution_t res = mlx.getResolution();
     switch (res) {
@@ -175,7 +176,6 @@ void setup() {
             break;
     }
 
-    mlx.setRefreshRate(MLX90640_8_HZ);
     Serial.print("Current frame rate: ");
     mlx90640_refreshrate_t rate = mlx.getRefreshRate();
     switch (rate) {
@@ -204,6 +204,31 @@ void setup() {
             Serial.println("64 Hz");
             break;
     }
+}
+
+void setup() {
+    Serial.begin(115200);
+    Serial.println("Boot");
+
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, LOW);
+
+    NVS.begin();
+
+    NVS.getBlob("ignore_mask", ignore_mask, sizeof(ignore_mask));
+
+    Wire.begin(22, 19, 800000);
+    if (!mlx.begin(MLX90640_I2CADDR_DEFAULT, &Wire)) {
+        Serial.println("MLX90640 not found!");
+    } else {
+        Serial.println("Found Adafruit MLX90640");
+    }
+
+    mlx.setMode(MLX90640_CHESS);
+    mlx.setResolution(MLX90640_ADC_19BIT);
+    mlx.setRefreshRate(MLX90640_16_HZ);
+
+    printSensorInfo();
 
     WiFi.mode(WIFI_STA);
 
@@ -254,18 +279,68 @@ void setup() {
 
     ArduinoOTA.begin();
 
-    server.on("/binary_sensor/raw", [](AsyncWebServerRequest *request) {
-        getRaw(0);
-        request->send(200, "application/json", output);
-    });
     server.on("/raw", [](AsyncWebServerRequest *request) {
-        getRaw(1);
+        getRaw();
         request->send(200, "application/json", output);
     });
+
+    server.on("/restart", [](AsyncWebServerRequest *request) {
+        request->send(200, "application/json", output);
+        ESP.restart();
+    });
+
+    server.on(
+        "/ignore_mask", HTTP_POST,
+        [](AsyncWebServerRequest *request) {
+            if (request->_tempObject != NULL) {
+                JsonDocument doc;
+                deserializeJson(doc, (const char *)request->_tempObject);
+                JsonArray new_ignore_mask = doc.as<JsonArray>();
+
+                if (new_ignore_mask.size() == PIXELS) {
+                    char nvs_name[10];
+                    uint8_t mask_temp = 0;
+                    uint8_t mask_index = 0;
+                    uint8_t nvs_index = 0;
+
+                    for (int i = 0; i < PIXELS; i++) {
+                        uint8_t temp = new_ignore_mask[i];
+                        ignore_mask[i] = temp == 0 ? 0 : 1;
+                    }
+                    NVS.eraseAll();
+                    NVS.setBlob("ignore_mask", ignore_mask, sizeof(ignore_mask));
+                    NVS.commit();
+
+                    request->send(200);
+                    return;
+                }
+            }
+            request->send(400);
+        },
+        NULL,
+        [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+            if (index == 0) {
+                if (request->_tempObject == NULL) {
+                    request->_tempObject = calloc(total + 1, sizeof(uint8_t));
+
+                    if (request->_tempObject == NULL) {
+                        request->abort();
+                        return;
+                    }
+                }
+            }
+
+            if (request->_tempObject != NULL) {
+                uint8_t *buffer = (uint8_t *)request->_tempObject;
+                memcpy(buffer + index, data, len);
+            }
+        });
 
     server.onNotFound([](AsyncWebServerRequest *request) { request->send(404); });
 
     server.begin();
+
+    digitalWrite(LED_PIN, HIGH);
 }
 
 uint32_t last_frame_update;
@@ -275,7 +350,11 @@ void loop() {
             last_frame_update = millis();
 
             for (int i = 0; i < PIXELS; i++) {
-                pixels[i] = ((uint16_t)(current_frame[i] * 10.0f)) / 2 + pixels[i] / 2;
+                if (isnan(current_frame[i])) {
+                    continue;
+                }
+
+                pixels[i] = (current_frame[i] + pixels[i]) / 2;
             }
         }
     }
@@ -284,17 +363,13 @@ void loop() {
 
     timeClient.update();
 
-    if (timeClient.getHours() == 5) {
-        int currentDay = timeClient.getDay();
+    uint32_t not_connected_start = millis();
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
 
-        if (currentDay != lastRestartDay) {
-            Serial.println("Restarting ESP32...");
-            lastRestartDay = currentDay;
-            delay(1000);
-
-            // 1s deep sleep instead of restart to keep lastRestartDay in memory
-            esp_sleep_enable_timer_wakeup(1000000);
-            esp_deep_sleep_start();
+        if (millis() - not_connected_start > 30000UL) {
+            ESP.restart();
         }
     }
 }
